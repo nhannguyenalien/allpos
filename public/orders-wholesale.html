@@ -267,15 +267,17 @@
                           <span id="gold-bought-show">0 chỉ</span>
                         </div>
                         <div class="d-flex justify-content-between mb-2">
-                          <span class="text-muted">Còn lại (99):</span>
+                          <span class="text-muted">Sau bù nợ cũ (99):</span>
                           <span id="gold-remaining-show" class="fw-bold">0 chỉ</span>
                         </div>
                         <div class="input-group input-group-sm mb-2">
                           <span class="input-group-text">Quy ra tiền</span>
                           <input id="gold-to-money-99" type="text" inputmode="decimal" step="0.001" class="form-control" oninput="onGoldToMoneyInput(this.value)"/>
                           <span class="input-group-text">chỉ</span>
+                          <button type="button" class="btn btn-outline-secondary" onclick="convertAllGold()">Quy hết</button>
                         </div>
-                        <div class="text-muted small mb-1">Phần vàng còn lại không quy ra tiền sẽ để lại thành nợ vàng.</div>
+                        <div id="gold-conversion-error" class="text-danger small mb-1" role="alert"></div>
+                        <div class="text-muted small mb-1">Nhập số âm khi cửa hàng trả tiền mua vàng. Quy phần vàng còn lại sau khi bù nợ cũ. Phần vàng còn lại không quy ra tiền sẽ để lại thành nợ vàng.</div>
                         <div class="d-flex justify-content-between">
                           <span class="text-muted">→ Nợ vàng còn lại:</span>
                           <span id="gold-debt-show" class="fw-bold">0 chỉ</span>
@@ -563,16 +565,17 @@
 
 <script src="https://cdn.jsdelivr.net/npm/@tabler/core@1.0.0/dist/js/tabler.min.js"></script>
 <script type="module">
+import { localInvoiceDate } from "/js/invoice-date.js";
 import { requireLogin } from "/js/auth.js";
   import { initSidebar } from "/js/sidebar.js";
 import { api } from "/js/api.js";
 import { printInvoiceA4, openPendingPrintWindow } from "/js/print.js";
-import { roundGold99, normalizeGoldConversion99 } from "/js/wholesale-math.js";
+import { roundGold99, normalizeGoldConversion99, parseGoldInput, isGoldConversionValid } from "/js/wholesale-math.js?v=20260924-2";
 
 requireLogin();
   initSidebar();
 // Init date
-document.getElementById("inv-date").value = new Date().toISOString().slice(0, 10);
+document.getElementById("inv-date").value = localInvoiceDate();
 
 const fmtVND = n => new Intl.NumberFormat("vi-VN").format(Math.round(n || 0)) + " đ";
 
@@ -1014,7 +1017,7 @@ window.removeTradeInRow = function(idx) {
 
 // Quy về vàng 99: TL bán ra và mua vào đều quy đổi theo tuổi/99 rồi trừ ròng cho
 // nhau trước (goldRemaining99); phần này mới chọn quy ra tiền (goldToMoney99, mặc
-// định = toàn bộ còn lại nhưng có thể sửa để giữ một phần làm nợ vàng riêng).
+// định = 0, phần không quy để lại làm nợ vàng riêng).
 window.onGoldToMoneyInput = function(value) {
   goldToMoneyDirty = value !== "";
   calcTotal();
@@ -1025,33 +1028,53 @@ window.onPayAmountInput = function(value) {
   calcTotal();
 };
 
-window.calcTotal = function() {
-  const goldPrice99 = parseFloat(document.getElementById("gold-price-99")?.value) || 0;
-
-  const goldSold99 = cart
+function currentGoldTotals() {
+  const sold = roundGold99(cart
     .filter(i => i.isMetal && i.metalType === "gold")
     .reduce((s, i) => s + i.weight * i.qty * (i.purity / 99), 0)
-    + customItems
-    .filter(it => it.purity > 0 && it.weight > 0)
-    .reduce((s, it) => s + it.weight * it.qty * (it.purity / 99), 0);
-  const goldBought99 = tradeIns.reduce((s, t) => s + (t.weight || 0) * ((t.purity || 0) / 99), 0);
-  const goldRemaining99 = goldSold99 - goldBought99;
+    + customItems.filter(it => it.purity > 0 && it.weight > 0)
+    .reduce((s, it) => s + it.weight * it.qty * (it.purity / 99), 0));
+  const bought = roundGold99(tradeIns.reduce((s, t) => s + (t.weight || 0) * ((t.purity || 0) / 99), 0));
+  return { sold, bought, remaining: roundGold99(sold - bought) };
+}
 
+function conversionOldGoldDebt() {
+  return roundGold99(lastDebtData?.gold_debt_99 || 0);
+}
+
+function goldConversionError(sold, bought, raw) {
+  if (!Number.isFinite(raw)) return "Số chỉ quy ra tiền không hợp lệ. Ví dụ: 1,5 hoặc 1.5.";
+  const conversion = normalizeGoldConversion99(sold, bought, raw, conversionOldGoldDebt());
+  if (isGoldConversionValid(sold, bought, conversion, conversionOldGoldDebt())) return "";
+  const remaining = roundGold99(sold - bought + conversionOldGoldDebt());
+  return `Sau khi bù nợ cũ còn ${remaining} chỉ 99. Số chỉ quy ra tiền phải từ ${Math.min(0, remaining)} đến ${Math.max(0, remaining)}. Bấm “Quy hết” để lấy đúng số còn lại.`;
+}
+
+window.convertAllGold = function() {
+  document.getElementById("gold-to-money-99").value = roundGold99(currentGoldTotals().remaining + conversionOldGoldDebt());
+  goldToMoneyDirty = true;
+  calcTotal();
+};
+
+window.calcTotal = function() {
+  const goldPrice99 = roundGold99(parseFloat(document.getElementById("gold-price-99")?.value) || 0);
+  const { sold: goldSold99, bought: goldBought99, remaining: goldRemaining99 } = currentGoldTotals();
   const gtmInput = document.getElementById("gold-to-money-99");
-  // Mặc định KHÔNG tự quy vàng còn lại ra tiền — để nguyên thành nợ vàng, nhân viên phải
-  // tự gõ số chỉ muốn quy ra tiền nếu khách có trả bớt bằng tiền mặt (khác với tiền hàng
-  // thường, vốn mặc định coi như khách trả đủ — xem onPayAmountInput/paid bên dưới).
   if (!goldToMoneyDirty) gtmInput.value = goldRemaining99 ? "0" : "";
-  const goldToMoney99 = parseFloat(gtmInput.value) || 0;
-  const goldDebt99 = goldRemaining99 - goldToMoney99;
+  const rawConversion = parseGoldInput(gtmInput.value);
+  const conversionError = goldConversionError(goldSold99, goldBought99, rawConversion);
+  document.getElementById("gold-conversion-error").textContent = conversionError;
+  gtmInput.classList.toggle("is-invalid", !!conversionError);
+  const goldToMoney99 = normalizeGoldConversion99(goldSold99, goldBought99, rawConversion, conversionOldGoldDebt());
+  const goldDebt99 = roundGold99(goldRemaining99 - goldToMoney99);
   const goldMoneyValue = Math.round(goldToMoney99 * goldPrice99);
 
-  const hasGoldActivity = goldSold99 > 0 || goldBought99 > 0;
+  const hasGoldActivity = goldSold99 > 0 || goldBought99 > 0 || conversionOldGoldDebt() !== 0;
   document.getElementById("gold-summary-block").classList.toggle("d-none", !hasGoldActivity);
   document.getElementById("gold-money-row").classList.toggle("d-none", !hasGoldActivity);
   document.getElementById("gold-sold-show").textContent = `${goldSold99.toFixed(3)} chỉ`;
   document.getElementById("gold-bought-show").textContent = `${goldBought99.toFixed(3)} chỉ`;
-  document.getElementById("gold-remaining-show").textContent = `${goldRemaining99.toFixed(3)} chỉ`;
+  document.getElementById("gold-remaining-show").textContent = `${roundGold99(goldRemaining99 + conversionOldGoldDebt()).toFixed(3)} chỉ`;
   document.getElementById("gold-money-show").textContent = fmtVND(goldMoneyValue);
 
   // Cộng dồn nợ vàng cũ (đã hiện lúc chọn khách) vào số nợ vàng cuối cùng, giống nợ tiền
@@ -1073,11 +1096,11 @@ window.calcTotal = function() {
   // Tạm tính gồm: hàng thường (giá đầy đủ) + bạc (giá đầy đủ) + vàng (chỉ tiền công,
   // vì tiền vàng thật đã cộng riêng qua goldMoneyValue ở trên — tránh tính trùng) +
   // mục tuỳ ý (giá/công tương tự, phần vàng của nó đã quy vào goldSold99 ở trên).
-  const subtotal    = cart.reduce((s, i) => s + i.qty * i.unitPrice, 0)
-                    + customItems.reduce((s, it) => s + it.qty * it.price, 0);
+  const subtotal    = cart.reduce((s, i) => s + i.qty * Math.round(i.unitPrice), 0)
+                    + customItems.reduce((s, it) => s + it.qty * Math.round(it.price), 0);
   const preDiscount = subtotal + goldMoneyValue;
   const ckPct       = parseFloat(document.getElementById("discount-pct").value) || 0;
-  const discount    = preDiscount * ckPct / 100;
+  const discount    = Math.round(preDiscount * ckPct / 100);
   const total       = preDiscount - discount;
   const isRefund    = total < 0;
   // Nợ cũ (tiền, đã hiện lúc chọn khách) — lấy sớm ở đây để dùng luôn cho "Tổng tiền thanh
@@ -1107,8 +1130,15 @@ window.calcTotal = function() {
   // Mặc định coi như khách trả đủ tiền hàng của toa này (khác với vàng — mặc định để
   // nợ) — nhân viên tự sửa số nếu khách chỉ trả một phần hoặc chưa trả gì. Ô "Số tiền"
   // luôn nhập số dương trên giao diện — chỉ đổi dấu khi gửi lên server.
+  // Khi sửa hoá đơn nháp, ô này là khoản THU/HOÀN THÊM lần này (ngoài số đã ghi nhận trước
+  // đó) — mặc định là phần còn lại của riêng toa này, bấm "Cập nhật" sẽ ghi nhận luôn.
   const payAmountInput = document.getElementById("pay-amount");
-  if (!payAmountDirty) payAmountInput.value = Math.abs(total) ? Math.round(Math.abs(total)) : "";
+  const alreadyPaid = editOrderId ? Math.abs(editingPaidAmount) : 0;
+  const remainingThisOrder = Math.max(0, Math.round(Math.abs(total)) - alreadyPaid);
+  if (!payAmountDirty) payAmountInput.value = remainingThisOrder || "";
+  if (editOrderId && alreadyPaid) {
+    document.getElementById("pay-section-label").textContent = `${isRefund ? "Hoàn thêm" : "Thu thêm"} (đã ${isRefund ? "hoàn" : "thu"} ${fmtVND(alreadyPaid)})`;
+  }
   const paid = Math.abs(parseInt(payAmountInput.value) || 0);
   const debtThisOrder = Math.max(0, Math.abs(total) - paid); // độ lớn còn lại của RIÊNG toa này
 
@@ -1117,7 +1147,7 @@ window.calcTotal = function() {
   // nhưng toa này tiệm nợ khách) vì sẽ ra sai hẳn, có thể đảo chiều ai nợ ai — đúng bug thật
   // đã gặp khi trước đây loại hẳn toa hoàn tiền ra khỏi việc cộng dồn để né lỗi này.
   // Quy ước dấu khớp với API /api/customers/:id/debt: dương = khách nợ tiệm, âm = tiệm nợ khách.
-  const paidSigned = isRefund ? -paid : paid;
+  const paidSigned = (editOrderId ? editingPaidAmount : 0) + (isRefund ? -paid : paid);
   const thisOrderNet = total - paidSigned;
   const combinedNet = thisOrderNet + oldMoneyDebt;
   const debt = Math.abs(combinedNet);
@@ -1451,21 +1481,18 @@ function buildWholesalePayload() {
   // chỉ đang hiển thị 3 số lẻ. Chuẩn hoá ngay trước khi đóng gói payload để số gửi đi,
   // số xem trước và số backend tính nợ luôn thống nhất.
   const goldPrice99 = roundGold99(parseFloat(document.getElementById("gold-price-99")?.value) || 0);
-  const goldSold99 = roundGold99(cart
-    .filter(i => i.isMetal && i.metalType === "gold")
-    .reduce((s, i) => s + i.weight * i.qty * (i.purity / 99), 0)
-    + customItems
-    .filter(it => it.purity > 0 && it.weight > 0)
-    .reduce((s, it) => s + it.weight * it.qty * (it.purity / 99), 0));
-  const goldBought99 = roundGold99(tradeIns.reduce((s, t) => s + (t.weight || 0) * ((t.purity || 0) / 99), 0));
-  const goldToMoney99 = normalizeGoldConversion99(
-    goldSold99,
-    goldBought99,
-    parseFloat(document.getElementById("gold-to-money-99")?.value) || 0,
-  );
+  const { sold: goldSold99, bought: goldBought99 } = currentGoldTotals();
+  const rawConversion = parseGoldInput(document.getElementById("gold-to-money-99")?.value);
+  const conversionError = goldConversionError(goldSold99, goldBought99, rawConversion);
+  if (conversionError) {
+    alert(conversionError);
+    document.getElementById("gold-to-money-99").focus();
+    return null;
+  }
+  const goldToMoney99 = normalizeGoldConversion99(goldSold99, goldBought99, rawConversion, conversionOldGoldDebt());
   // Giá vàng 99 chỉ dùng để quy phần "Quy ra tiền" ra đồng — nếu để nguyên hết thành nợ
   // vàng (Quy ra tiền = 0) thì không cần giá cũng tạo đơn được, khỏi phải nhập cho có.
-  if (Math.abs(goldToMoney99) > 0.0005 && goldPrice99 <= 0) { alert("⚠️ Cần nhập giá vàng 99/chỉ để quy phần vàng ra tiền"); return null; }
+  if (goldToMoney99 !== 0 && goldPrice99 <= 0) { alert("⚠️ Cần nhập giá vàng 99/chỉ để quy phần vàng ra tiền"); return null; }
   const makingFeeTotal = Math.round(cart
     .filter(i => i.isMetal && i.metalType === "gold")
     .reduce((s, i) => s + i.fee * i.qty, 0)
@@ -1475,8 +1502,8 @@ function buildWholesalePayload() {
   const goldMoneyValue = Math.round(goldToMoney99 * goldPrice99);
 
   const ckPct     = parseFloat(document.getElementById("discount-pct").value) || 0;
-  const subtotal  = cart.reduce((s, i) => s + i.qty * i.unitPrice, 0)
-                  + customItems.reduce((s, it) => s + it.qty * it.price, 0);
+  const subtotal  = cart.reduce((s, i) => s + i.qty * Math.round(i.unitPrice), 0)
+                  + customItems.reduce((s, it) => s + it.qty * Math.round(it.price), 0);
   const discount  = Math.round((subtotal + goldMoneyValue) * ckPct / 100);
   const rawPayAmt = Math.abs(parseInt(document.getElementById("pay-amount").value) || 0);
 
@@ -1537,7 +1564,15 @@ function buildWholesalePayload() {
     old_money_debt: oldMoneyDebt,
     old_gold_debt_99: oldGoldDebt99,
   };
-  if (!isEditing) { payload.order_type = "wholesale"; payload.is_quick = isQuickMode; }
+  if (!isEditing) {
+    const invoiceDate = document.getElementById("inv-date");
+    if (!invoiceDate.value || !invoiceDate.reportValidity()) {
+      alert("Vui lòng chọn ngày lập hóa đơn hợp lệ.");
+      return null;
+    }
+    payload.invoice_date = invoiceDate.value;
+    payload.order_type = "wholesale"; payload.is_quick = isQuickMode;
+  }
 
   return { payload, rawPayAmt, isEditing, subtotal, goldMoneyValue, discount, goldSold99, goldBought99, goldToMoney99, oldMoneyDebt, oldGoldDebt99 };
 }
@@ -1556,12 +1591,12 @@ window.createWholesaleOrder = async function() {
   const isRefundPreview = total < 0;
   // Cộng dồn nợ cũ + toa này bằng số CÓ DẤU trước, chỉ lấy độ lớn lúc hiển thị — không được
   // cộng 2 độ lớn của 2 chiều ngược nhau (xem giải thích chi tiết trong calcTotal() ở trên).
-  const paidSignedPreview = isRefundPreview ? -rawPayAmt : rawPayAmt;
+  const paidSignedPreview = (isEditing ? editingPaidAmount : 0) + (isRefundPreview ? -rawPayAmt : rawPayAmt);
   const thisOrderNetPreview = total - paidSignedPreview;
   const combinedNetPreview = thisOrderNetPreview + oldMoneyDebt;
   const previewMoneyDebt = Math.abs(combinedNetPreview);
   const previewGoldDebt = (goldSold99 - goldBought99) - goldToMoney99 + oldGoldDebt99;
-  const hasGoldActivity = goldSold99 > 0 || goldBought99 > 0;
+  const hasGoldActivity = goldSold99 > 0 || goldBought99 > 0 || conversionOldGoldDebt() !== 0;
 
   document.getElementById("cf-cust-name").textContent = lastDebtData?.custName || custSearch.value || "";
   document.getElementById("cf-subtotal").textContent = fmtVND(subtotal);
@@ -1570,7 +1605,8 @@ window.createWholesaleOrder = async function() {
   document.getElementById("cf-discount-row").classList.toggle("d-none", discount <= 0);
   document.getElementById("cf-discount").textContent = "- " + fmtVND(discount);
   document.getElementById("cf-total").textContent = (isRefundPreview ? "Tiệm cần hoàn: " : "") + fmtVND(Math.abs(total));
-  document.getElementById("cf-paid").textContent = fmtVND(rawPayAmt);
+  document.getElementById("cf-paid").textContent = fmtVND(rawPayAmt)
+    + (isEditing && editingPaidAmount ? ` (+ đã ghi nhận trước ${fmtVND(Math.abs(editingPaidAmount))})` : "");
   document.getElementById("cf-money-debt-label").textContent = combinedNetPreview >= 0 ? "Nợ tiền còn lại (kể cả nợ cũ)" : "Tiệm còn nợ khách (kể cả nợ cũ)";
   const cfMoneyDebtEl = document.getElementById("cf-money-debt");
   cfMoneyDebtEl.textContent = fmtVND(previewMoneyDebt);
@@ -1624,19 +1660,20 @@ async function doSubmitOrder(payload, meta) {
   else btn.textContent = isEditing ? "⏳ Đang cập nhật..." : "⏳ Đang tạo...";
 
   try {
-    // Toa mới và khoản thanh toán phải được backend lưu trong cùng một transaction.
-    // Không gửi payment riêng sau khi tạo toa vì nếu request thứ hai lỗi, toa sẽ thành nợ.
-    if (!isEditing && !draft && rawPayAmt > 0) {
+    // Toa và khoản thanh toán phải được backend lưu trong cùng một transaction (cả lúc tạo
+    // mới lẫn lúc "Cập nhật" hoàn tất toa nháp). Không gửi payment riêng sau đó vì nếu
+    // request thứ hai lỗi, toa sẽ thành nợ.
+    delete payload.initial_payment;
+    delete payload.additional_payment;
+    if (!draft && rawPayAmt > 0) {
       const expectedTotal = payload.items.reduce((sum, item) =>
         sum + item.unit_price * item.quantity - (item.discount || 0), 0)
         + Math.round(payload.gold_to_money_99 * payload.gold_price_99)
         - payload.discount;
-      payload.initial_payment = {
+      payload[isEditing ? "additional_payment" : "initial_payment"] = {
         method: document.getElementById("pay-method").value,
         amount: expectedTotal < 0 ? -rawPayAmt : rawPayAmt,
       };
-    } else {
-      delete payload.initial_payment;
     }
     const orderRes = isEditing
       ? await api.put(`/api/orders/${editOrderId}`, payload)
@@ -1645,7 +1682,9 @@ async function doSubmitOrder(payload, meta) {
     const orderId = orderRes.order_id || orderRes.id || editOrderId;
 
     if (isEditing) {
-      alert(`✅ Đã cập nhật hoá đơn ${orderRes.order_number}.`);
+      alert(orderRes.status === "completed"
+        ? `✅ Đã cập nhật và hoàn tất hoá đơn ${orderRes.order_number}.`
+        : `✅ Đã cập nhật hoá đơn ${orderRes.order_number} (vẫn còn nợ, đơn giữ trạng thái nháp).`);
       location.href = `/orders-list.html?open=${orderId}&include_quick=1`;
       return;
     }
@@ -1670,6 +1709,7 @@ async function doSubmitOrder(payload, meta) {
     document.getElementById("cust-info").textContent = "";
     document.getElementById("cust-debt").innerHTML = "";
     lastDebtData = null;
+    document.getElementById("inv-date").value = localInvoiceDate();
     document.getElementById("pay-amount").value = "";
     document.getElementById("discount-pct").value = "0";
     document.getElementById("gold-price-99").value = "";
@@ -1692,6 +1732,7 @@ async function doSubmitOrder(payload, meta) {
 // ── SỬA HOÁ ĐƠN NHÁP (?edit=<id>) ────────────────────────
 let editOrderId = null;
 let editingOldDebt = null;
+let editingPaidAmount = 0;
 let editingOriginalCustomerId = null;
 
 async function loadOrderForEdit(orderId) {
@@ -1704,6 +1745,9 @@ async function loadOrderForEdit(orderId) {
   if (order.status !== "pending") { alert("Hoá đơn đã đóng, không thể sửa."); return; }
 
   editOrderId = orderId;
+  document.getElementById("inv-date").value = localInvoiceDate(new Date(order.created_at));
+  document.getElementById("inv-date").disabled = true;
+  editingPaidAmount = (res.payments || []).filter(p => p.status === "completed").reduce((sum, p) => sum + Number(p.amount), 0);
   editingOriginalCustomerId = order.customer_id || null;
   editingOldDebt = { money_debt: parseInt(order.old_money_debt) || 0, gold_debt_99: parseFloat(order.old_gold_debt_99) || 0 };
 
@@ -1711,9 +1755,8 @@ async function loadOrderForEdit(orderId) {
   document.getElementById("page-subtitle").textContent = `Đang sửa đơn ${order.order_number} — lưu lại sẽ cập nhật đè lên nội dung cũ`;
   const btn = document.getElementById("submit-order-btn");
   btn.textContent = "💾 Cập nhật hoá đơn nháp";
-  // Đang sửa 1 đơn nháp sẵn có thì bản thân nút "Cập nhật" đã LÀ lưu tạm rồi (đơn vẫn giữ
-  // nguyên trạng thái nháp sau khi lưu) — ẩn nút "Lưu tạm" riêng để khỏi trùng lặp/gây rối.
-  document.getElementById("save-draft-btn").classList.add("d-none");
+  // "Cập nhật" ghi nhận luôn số tiền trong ô thanh toán (thu đủ thì đơn hoàn tất). Muốn chỉ
+  // lưu lại nội dung mà chưa thu tiền thì dùng "Lưu tạm".
 
   // Bật chế độ nháp (đơn đang sửa chắc chắn là nháp) để hiện khung "Mục tuỳ ý"
   document.getElementById("quick-mode-toggle").checked = true;
@@ -1743,7 +1786,7 @@ async function loadOrderForEdit(orderId) {
   // để tiện sửa tiếp (nếu người dùng đổi mặt hàng, % này áp lại trên tổng mới).
   const goldMoneyValueLoaded = Math.round((parseFloat(order.gold_to_money_99) || 0) * (parseFloat(order.gold_price_99) || 0));
   const preDiscountLoaded = (parseInt(order.subtotal) || 0) + goldMoneyValueLoaded;
-  const pctLoaded = preDiscountLoaded > 0 ? Math.round(((parseInt(order.discount) || 0) / preDiscountLoaded) * 1000) / 10 : 0;
+  const pctLoaded = preDiscountLoaded !== 0 ? ((parseInt(order.discount) || 0) / preDiscountLoaded) * 100 : 0;
   document.getElementById("discount-pct").value = pctLoaded;
 
   // Mặt hàng: có product_variant_id → cart (hàng trong danh mục); không có → customItems
@@ -1752,7 +1795,7 @@ async function loadOrderForEdit(orderId) {
   customItems = [];
   for (const item of items) {
     let md = null;
-    try { md = item.metal_details ? JSON.parse(item.metal_details) : null; } catch { md = null; }
+    try { md = item.metal_details ? (typeof item.metal_details === "string" ? JSON.parse(item.metal_details) : item.metal_details) : null; } catch { md = null; }
     const unitPrice = parseInt(item.unit_price) || 0;
     if (item.product_variant_id) {
       if (md && md.metalType === "gold") {
@@ -1780,7 +1823,7 @@ async function loadOrderForEdit(orderId) {
   renderCustomItems();
 
   // Hàng cũ khách trả
-  try { tradeIns = order.trade_in_details ? JSON.parse(order.trade_in_details) : []; } catch { tradeIns = []; }
+  try { tradeIns = order.trade_in_details ? (typeof order.trade_in_details === "string" ? JSON.parse(order.trade_in_details) : order.trade_in_details) : []; } catch { tradeIns = []; }
   renderTradeIns();
 
   // Giữ nguyên đúng số "Quy ra tiền" đã chốt lúc tạo, không để calcTotal() tự tính đè.

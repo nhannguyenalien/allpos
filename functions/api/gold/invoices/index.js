@@ -1,3 +1,4 @@
+import { isValidInvoiceDate } from "../../../../public/js/invoice-date.js";
 // GET  /api/gold/invoices  — danh sách hoá đơn
 // POST /api/gold/invoices  — tạo hoá đơn mới
 import { getDb, json, errorJson, handleOptions } from "../../../_db.js";
@@ -66,6 +67,8 @@ async function createInvoice({ request, env }, { tenantId, userId }) {
     customer_paid_money = 0,
     notes,
   } = body;
+
+  if (invoice_date !== undefined && !isValidInvoiceDate(invoice_date)) return errorJson("Ngày hóa đơn không hợp lệ", 422);
 
   if (!gold_price_per_chi) return errorJson("Cần nhập giá vàng 99/chỉ", 422);
   if (!items.length && !returns.length) return errorJson("Cần ít nhất 1 hàng bán ra hoặc 1 hàng dê thu mua", 422);

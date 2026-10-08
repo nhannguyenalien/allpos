@@ -1,6 +1,36 @@
-const CHAT_LINK_ENDPOINT = "https://knowledge-worker.toidayhoc.workers.dev/api/v1/chat-link";
-const CUSTOMER_CONTEXT_ENDPOINT = "https://knowledge-worker.toidayhoc.workers.dev/api/v1/customer-context";
-const MESSAGES_ENDPOINT = "https://knowledge-worker.toidayhoc.workers.dev/api/v1/messages";
+const DEFAULT_SCHOOLSAI_API_BASE = "https://apic.schoolsai.work";
+
+export function schoolsAiEndpoint(env, path) {
+  const base = String(env?.KNOWLEDGE_WORKER_BASE_URL || DEFAULT_SCHOOLSAI_API_BASE)
+    .trim()
+    .replace(/\/+$/, "");
+  return `${base}/api/v1/${String(path).replace(/^\/+/, "")}`;
+}
+
+// SchoolsAI chỉ nhận customer_context dạng object phẳng. Các danh sách được serialize
+// thành JSON string để bot vẫn đọc được đầy đủ mà không vi phạm contract của API.
+export function toSchoolsAiCustomerContext(source) {
+  const customer = source.customer || {};
+  const debt = source.debt || {};
+  return {
+    schema_version: String(source.schema_version || 1),
+    synced_at: source.synced_at || new Date().toISOString(),
+    customer_id: String(customer.id || ""),
+    customer_name: customer.name || "",
+    customer_phone: customer.phone || "",
+    customer_email: customer.email || "",
+    customer_address: customer.address || "",
+    customer_is_business: String(Boolean(customer.is_business)),
+    customer_tax_code: customer.tax_code || "",
+    customer_created_at: customer.created_at || "",
+    debt_money: String(Number(debt.money) || 0),
+    debt_money_direction: debt.money_direction || "customer_owes_shop",
+    debt_gold_99: String(Number(debt.gold_99) || 0),
+    debt_gold_direction: debt.gold_direction || "customer_owes_shop",
+    recent_orders_json: JSON.stringify(source.recent_orders || []),
+    recent_gold_orders_json: JSON.stringify(source.recent_gold_orders || []),
+  };
+}
 
 export async function getKnowledgeWorkerToken(sql, env, tenantId) {
   const rows = await sql`
@@ -142,8 +172,9 @@ export async function syncCustomerSupportContext(sql, env, tenantId, customerId,
   if (!supportSession) return { skipped: true };
   const token = await getKnowledgeWorkerToken(sql, env, tenantId);
   if (!token) return { skipped: true };
-  const context = await buildCustomerSupportContext(sql, tenantId, customerId);
-  const response = await fetch(CUSTOMER_CONTEXT_ENDPOINT, {
+  const source = await buildCustomerSupportContext(sql, tenantId, customerId);
+  const context = toSchoolsAiCustomerContext(source);
+  const response = await fetch(schoolsAiEndpoint(env, "customer-context"), {
     method: "PUT",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ session: supportSession, context }),
@@ -173,7 +204,7 @@ export async function sendSupportChatMessage(sql, env, tenantId, customerId, tex
   const token = await getKnowledgeWorkerToken(sql, env, tenantId);
   if (!token) return { skipped: true };
 
-  const response = await fetch(MESSAGES_ENDPOINT, {
+  const response = await fetch(schoolsAiEndpoint(env, "messages"), {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ session: supportSession, text }),
@@ -187,7 +218,7 @@ export async function createSupportChatLink(sql, env, tenantId, customerName) {
   const token = await getKnowledgeWorkerToken(sql, env, tenantId);
   if (!token) throw new Error("Chưa cấu hình API key Social/Knowledge Worker");
 
-  const response = await fetch(CHAT_LINK_ENDPOINT, {
+  const response = await fetch(schoolsAiEndpoint(env, "chat-link"), {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,

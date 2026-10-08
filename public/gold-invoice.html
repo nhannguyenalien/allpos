@@ -138,8 +138,8 @@
     <input id="dia-chi" class="inv-input" type="text"/>
     <label>SĐT:</label>
     <input id="dien-thoai" class="inv-input" type="text"/>
-    <label>Ngày:</label>
-    <input id="ngay-toa" class="inv-input" type="text" style="width:120px"/>
+    <label for="ngay-toa">Ngày:</label>
+    <input id="ngay-toa" class="inv-input" type="date" required onchange="calcAll()" style="width:150px"/>
     <label>MST khách (nếu có):</label>
     <input id="khach-mst" class="inv-input" type="text" placeholder="Để trống nếu khách lẻ"/>
     <label>Tên công ty (nếu có):</label>
@@ -435,7 +435,7 @@ const invoiceId = params.get("id");
 let currentInvoiceId = invoiceId; // cập nhật sau khi Lưu thành công (invoiceId ở trên là const)
 const today    = new Date();
 $("ngay-toa").value =
-  `${today.getDate().toString().padStart(2,"0")}/${(today.getMonth()+1).toString().padStart(2,"0")}/${today.getFullYear()}`;
+  `${today.getFullYear()}-${(today.getMonth()+1).toString().padStart(2,"0")}-${today.getDate().toString().padStart(2,"0")}`;
 
 // Load invoice nếu xem lại
 if (invoiceId) loadInvoice(invoiceId);
@@ -676,15 +676,17 @@ function renderPurchaseVoucher() {
   $("pv-total").textContent       = fmt(total) + " đ";
   $("pv-total-words").textContent = amountToWords(total);
 
-  const dateParts = ($("ngay-toa").value || "").split("/");
+  const dateParts = ($("ngay-toa").value || "").split("-");
   $("pv-date").textContent = dateParts.length === 3
-    ? `${dateParts[0]}/${dateParts[1]}/${dateParts[2]}`
+    ? `${dateParts[2]}/${dateParts[1]}/${dateParts[0]}`
     : "…../…../…………";
 }
 
 // ── LƯU VÀO API ─────────────────────────────────────────
 window.saveInvoice = async function() {
   if (invoiceId) { window.print(); return; } // Nếu đang xem lại thì in luôn
+
+  if (!$("ngay-toa").reportValidity()) return;
 
   const sdt = $("dien-thoai").value.trim();
   if (!sdt) {
@@ -735,6 +737,7 @@ window.saveInvoice = async function() {
   }
 
   const payload = {
+    invoice_date: $("ngay-toa").value,
     customer_name:    $("khach-hang").value.trim() || null,
     customer_phone:   sdt,
     customer_address: $("dia-chi").value.trim() || null,
@@ -848,9 +851,7 @@ async function loadInvoice(id) {
       $("einvoice-status").textContent = "❌ " + (invoice.einvoice_error || "Lỗi xuất VAT lần trước");
     }
     // Điền ngày từ invoice_date
-    const d = new Date(invoice.invoice_date);
-    $("ngay-toa").value =
-      `${d.getDate().toString().padStart(2,"0")}/${(d.getMonth()+1).toString().padStart(2,"0")}/${d.getFullYear()}`;
+    $("ngay-toa").value = invoice.invoice_date.slice(0, 10);
 
     // Các field thống kê
     $("sum-no-cu-vang").value  = invoice.gold_prev_debt;

@@ -1,0 +1,6 @@
+name = "allpos"
+compatibility_date = "2026-06-01"
+pages_build_output_dir = "public"
+
+# Staging/dev project tách biệt khỏi pos-app (khách đang dùng).
+# Secrets đặt bằng: npx wrangler pages secret put <KEY> --project-name allpos

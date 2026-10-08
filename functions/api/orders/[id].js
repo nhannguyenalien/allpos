@@ -1,5 +1,6 @@
+import { isGoldConversionValid, isOrderSettled, normalizeGoldConversion99, roundGold99 } from "../../../public/js/wholesale-math.js";
 import { getDb, json, errorJson, handleOptions } from "../../_db.js";
-import { requireAuth } from "../../_auth.js";
+import { requireAuth, requirePermission } from "../../_auth.js";
 import { ensureCustomerSupportLink, syncCustomerSupportContext } from "../../_support-chat.js";
 
 export async function onRequest(context) {
@@ -9,9 +10,18 @@ export async function onRequest(context) {
   const auth = await requireAuth(context);
   if (auth instanceof Response) return auth;
 
+  const permission = context.request.method === "GET"
+    ? "orders.read"
+    : context.request.method === "DELETE" ? "orders.status" : "orders.write";
+  const allowed = await requirePermission(context, auth, permission);
+  if (allowed instanceof Response) return allowed;
+
   const { id } = context.params;
   if (context.request.method === "GET") return getOrder(context, auth, id);
   if (context.request.method === "PUT") return updateOrder(context, auth, id);
+  // Không xóa vật lý chứng từ kế toán. DELETE là thao tác hủy có hoàn kho, đồng bộ
+  // công nợ và vẫn giữ nguyên audit trail để bot/operator có thể tra soát.
+  if (context.request.method === "DELETE") return changeOrderStatus(context, auth, id, { status: "cancelled" });
   return errorJson("Method not allowed", 405);
 }
 
@@ -149,8 +159,12 @@ export async function editDraftOrder({ env }, { tenantId }, id, body) {
     customer_id, items = [], discount = 0, notes = null,
     trade_in_total = 0, trade_in_details = null,
     gold_price_99 = 0, gold_sold_99 = 0, gold_bought_99 = 0,
-    gold_to_money_99 = 0, making_fee_total = 0,
+    gold_to_money_99: requestedGoldConversion = 0, making_fee_total = 0,
+    // Khoản thu/hoàn thêm lúc bấm "Cập nhật" để hoàn tất toa nháp — ghi cùng transaction
+    // với nội dung toa, giống initial_payment của createOrder.
+    additional_payment = null,
   } = body;
+  let gold_to_money_99 = requestedGoldConversion;
   let { old_money_debt = 0, old_gold_debt_99 = 0 } = body;
   // Hoá đơn nháp LUÔN cần khách hàng để lưu công nợ (giống điều kiện lúc tạo mới) — thiếu
   // check này thì 1 request thiếu customer_id sẽ âm thầm gỡ đơn ra khỏi công nợ của khách.
@@ -197,14 +211,25 @@ export async function editDraftOrder({ env }, { tenantId }, id, body) {
     old_gold_debt_99 = debtRows[0]?.gold_debt_99 || 0;
   }
 
+  // Khi giữ nguyên khách, dùng snapshot đã lưu, không để request sửa nợ cũ.
+  if (customer_id === existing.customer_id) old_gold_debt_99 = existing.old_gold_debt_99 || 0;
+  gold_to_money_99 = [gold_sold_99, gold_bought_99, gold_to_money_99, old_gold_debt_99].every(v => Number.isFinite(Number(v)))
+      ? normalizeGoldConversion99(gold_sold_99, gold_bought_99, gold_to_money_99, old_gold_debt_99) : NaN;
+  if (!isGoldConversionValid(gold_sold_99, gold_bought_99, gold_to_money_99, old_gold_debt_99)) {
+    return errorJson("Số vàng quy ra tiền phải cùng chiều và không vượt phần vàng còn lại sau khi bù nợ cũ", 422, "INVALID_GOLD_CONVERSION");
+  }
+  if (Number(gold_to_money_99) !== 0 && !(Number(gold_price_99) > 0)) {
+    return errorJson("Cần nhập giá vàng 99/chỉ để quy ra tiền", 422, "INVALID_GOLD_PRICE");
+  }
+
   const subtotal = items.reduce((sum, i) => sum + i.unit_price * i.quantity - (i.discount || 0), 0);
 
   // Nhận diện toa vàng qua gold_sold_99/gold_bought_99, KHÔNG dùng gold_price_99>0 —
   // giá vàng có thể để trống nếu để nguyên hết thành nợ vàng (xem createOrder cùng lý do).
   let total, goldDebt99 = 0;
-  if (gold_sold_99 > 0 || gold_bought_99 > 0) {
+  if (gold_sold_99 > 0 || gold_bought_99 > 0 || Number(gold_to_money_99) !== 0) {
     const goldRemaining99 = gold_sold_99 - gold_bought_99;
-    goldDebt99 = goldRemaining99 - gold_to_money_99;
+    goldDebt99 = roundGold99(goldRemaining99 - gold_to_money_99);
     const goldMoneyValue = Math.round(gold_to_money_99 * gold_price_99);
     total = subtotal + goldMoneyValue - discount;
   } else {
@@ -227,21 +252,49 @@ export async function editDraftOrder({ env }, { tenantId }, id, body) {
     );
   }
 
+  let paymentAmount = 0;
+  let paymentMethod = null;
+  if (additional_payment !== null && additional_payment !== undefined) {
+    paymentAmount = additional_payment?.amount;
+    paymentMethod = additional_payment?.method;
+    if (!Number.isSafeInteger(paymentAmount) || paymentAmount === 0) {
+      return errorJson("Số tiền thanh toán phải là số nguyên VND khác 0", 422, "INVALID_PAYMENT_AMOUNT");
+    }
+    if (typeof paymentMethod !== "string" || !paymentMethod.trim()) {
+      return errorJson("Phương thức thanh toán là bắt buộc", 422, "INVALID_PAYMENT_METHOD");
+    }
+    if ((total >= 0 && paymentAmount < 0) || (total < 0 && paymentAmount > 0)) {
+      return errorJson("Chiều thu/trả tiền không khớp với tổng toa", 422, "INVALID_PAYMENT_DIRECTION");
+    }
+  }
+  // Trước đây sửa nháp không bao giờ đổi trạng thái — toa đã thu đủ vẫn nằm "pending" và
+  // bị tính là nợ. Thu đủ tiền (gồm khoản vừa thu) và hết nợ vàng thì chốt "completed".
+  const status = isOrderSettled(total, paid + paymentAmount, goldDebt99) ? "completed" : "pending";
+
   const now = new Date().toISOString();
 
-  await sql`DELETE FROM order_items WHERE order_id = ${id}`;
+  const queries = [sql`DELETE FROM order_items WHERE order_id = ${id}`];
   for (const item of items) {
     const itemId = crypto.randomUUID();
     const itemTotal = item.unit_price * item.quantity - (item.discount || 0);
-    await sql`
+    queries.push(sql`
       INSERT INTO order_items (id, order_id, product_variant_id, item_name, quantity, unit_price, discount, total, metal_details, created_at)
       VALUES (${itemId}, ${id}, ${item.product_variant_id || null}, ${item.item_name || null},
               ${item.quantity}, ${item.unit_price}, ${item.discount || 0}, ${itemTotal},
               ${item.metal_details ? JSON.stringify(item.metal_details) : null}, ${now})
-    `;
+    `);
   }
-
-  const rows = await sql`
+  if (paymentAmount !== 0) {
+    queries.push(sql`
+      INSERT INTO payments
+        (id, tenant_id, order_id, method, amount, status, payment_date, reference_no, created_at)
+      VALUES
+        (${crypto.randomUUID()}, ${tenantId}, ${id}, ${paymentMethod.trim()},
+         ${paymentAmount}, 'completed', ${now}, ${additional_payment?.reference_no || null}, ${now})
+    `);
+  }
+  const updateIndex = queries.length;
+  queries.push(sql`
     UPDATE orders SET
       customer_id = ${customer_id || null}, subtotal = ${subtotal}, discount = ${discount}, total = ${total},
       trade_in_total = ${trade_in_total},
@@ -249,10 +302,18 @@ export async function editDraftOrder({ env }, { tenantId }, id, body) {
       gold_price_99 = ${gold_price_99}, gold_sold_99 = ${gold_sold_99}, gold_bought_99 = ${gold_bought_99},
       gold_to_money_99 = ${gold_to_money_99}, gold_debt_99 = ${goldDebt99}, making_fee_total = ${making_fee_total},
       notes = ${notes || null}, old_money_debt = ${old_money_debt}, old_gold_debt_99 = ${old_gold_debt_99},
-      updated_at = ${now}
+      status = ${status}, updated_at = ${now}
     WHERE id = ${id} AND tenant_id = ${tenantId}
-    RETURNING id, order_number, total, gold_debt_99
-  `;
+    RETURNING id, order_number, status, total, gold_debt_99
+  `);
+
+  let rows;
+  try {
+    rows = (await sql.transaction(queries, { isolationLevel: "ReadCommitted" }))[updateIndex];
+  } catch (err) {
+    console.error("Không thể cập nhật hoá đơn nháp:", err);
+    return errorJson("Không thể cập nhật hoá đơn, vui lòng thử lại", 500, "ORDER_UPDATE_FAILED");
+  }
 
   for (const customerId of new Set([existing.customer_id, customer_id].filter(Boolean))) {
     try { await syncCustomerSupportContext(sql, env, tenantId, customerId); }

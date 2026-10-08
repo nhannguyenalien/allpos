@@ -1,0 +1,6 @@
+/orders-wholesale
+  Cache-Control: no-cache, max-age=0, must-revalidate
+/orders-wholesale.html
+  Cache-Control: no-cache, max-age=0, must-revalidate
+/js/wholesale-math.js
+  Cache-Control: no-cache, max-age=0, must-revalidate

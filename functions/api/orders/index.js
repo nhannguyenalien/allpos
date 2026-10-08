@@ -1,3 +1,5 @@
+import { isValidInvoiceDate } from "../../../public/js/invoice-date.js";
+import { isGoldConversionValid, isOrderSettled, normalizeGoldConversion99, roundGold99 } from "../../../public/js/wholesale-math.js";
 import { getDb, json, errorJson, handleOptions } from "../../_db.js";
 import { requireAuth, requirePermission } from "../../_auth.js";
 import {
@@ -11,14 +13,7 @@ import {
   parseIdempotency,
 } from "../../_idempotency.js";
 
-export function isOrderSettled(total, initialPaymentAmount, goldDebt99, goldEpsilon = 0.000001) {
-  const hasOutstandingGold = Math.abs(goldDebt99) > goldEpsilon;
-  const moneySettled = total === 0 || (initialPaymentAmount !== 0 && (
-    (total >= 0 && total - initialPaymentAmount <= 0)
-    || (total < 0 && total - initialPaymentAmount >= 0)
-  ));
-  return moneySettled && !hasOutstandingGold;
-}
+export { isOrderSettled };
 
 export async function onRequest(context) {
   const preflight = handleOptions(context.request);
@@ -108,7 +103,7 @@ async function createOrder({ request, env }, { tenantId, userId }) {
     // Mô hình "quy về vàng 99" cho bán sỉ — mọi TL vàng bán ra/mua vào đều quy về
     // chỉ 99 trước, phần còn lại mới chọn quy ra tiền (có thể để một phần làm nợ vàng).
     gold_price_99 = 0, gold_sold_99 = 0, gold_bought_99 = 0,
-    gold_to_money_99 = 0, making_fee_total = 0,
+    gold_to_money_99: requestedGoldConversion = 0, making_fee_total = 0,
     // Nợ cũ của khách TẠI THỜI ĐIỂM lập đơn (snapshot, lấy từ /api/customers/:id/debt lúc
     // chọn khách) — chỉ để hiển thị lại đúng lịch sử trên hoá đơn in, KHÔNG cộng vào
     // total/gold_debt_99 của đơn này để tránh tính trùng nợ (xem migrate_order_old_debt.sql).
@@ -116,7 +111,11 @@ async function createOrder({ request, env }, { tenantId, userId }) {
     // Khoản thu/trả ngay lúc chốt toa. Ghi cùng transaction với order để không thể có
     // trạng thái "toa đã tạo nhưng payment bị lỗi" rồi vô tình biến thành công nợ.
     initial_payment = null,
+    invoice_date,
   } = body;
+  if (invoice_date !== undefined && !isValidInvoiceDate(invoice_date)) return errorJson("Ngày hóa đơn không hợp lệ", 422);
+
+  let gold_to_money_99 = requestedGoldConversion;
   const validationErrors = [];
   if (!Array.isArray(items)) {
     validationErrors.push({ field: "items", rule: "array", message: "items phải là danh sách" });
@@ -200,16 +199,18 @@ async function createOrder({ request, env }, { tenantId, userId }) {
   // vàng (không quy đồng nào ra tiền) — nếu không, nợ vàng sẽ bị bỏ sót hoàn toàn.
   let total, goldDebt99 = 0, goldMoneyValue = 0;
   const goldEpsilon = 0.000001;
-  if (gold_sold_99 > 0 || gold_bought_99 > 0) {
+  if (gold_sold_99 > 0 || gold_bought_99 > 0 || Number(gold_to_money_99) !== 0) {
     const goldRemaining99 = gold_sold_99 - gold_bought_99;
+    gold_to_money_99 = [gold_sold_99, gold_bought_99, gold_to_money_99, old_gold_debt_99].every(v => Number.isFinite(Number(v)))
+      ? normalizeGoldConversion99(gold_sold_99, gold_bought_99, gold_to_money_99, old_gold_debt_99) : NaN;
     const goldConversion = Number(gold_to_money_99);
-    const conversionOutOfRange = goldRemaining99 >= 0
-      ? goldConversion < -goldEpsilon || goldConversion - goldRemaining99 > goldEpsilon
-      : goldConversion > goldEpsilon || goldRemaining99 - goldConversion > goldEpsilon;
-    if (conversionOutOfRange) {
-      return errorJson("Số vàng quy ra tiền phải cùng chiều và không vượt phần vàng còn lại", 422, "INVALID_GOLD_CONVERSION");
+    if (!isGoldConversionValid(gold_sold_99, gold_bought_99, goldConversion, old_gold_debt_99)) {
+      return errorJson("Số vàng quy ra tiền phải cùng chiều và không vượt phần vàng còn lại sau khi bù nợ cũ", 422, "INVALID_GOLD_CONVERSION");
     }
-    goldDebt99 = goldRemaining99 - gold_to_money_99;
+    if (goldConversion !== 0 && Number(gold_price_99) <= 0) {
+      return errorJson("Cần nhập giá vàng 99/chỉ để quy ra tiền", 422, "INVALID_GOLD_PRICE");
+    }
+    goldDebt99 = roundGold99(goldRemaining99 - goldConversion);
     goldMoneyValue = Math.round(gold_to_money_99 * gold_price_99);
     total = subtotal + goldMoneyValue - discount;
   } else {
@@ -243,6 +244,8 @@ async function createOrder({ request, env }, { tenantId, userId }) {
 
   const orderId = crypto.randomUUID();
   const now = new Date().toISOString();
+  // Existing lists, reports and invoice prints use created_at as the invoice date.
+  const invoiceCreatedAt = invoice_date ? `${invoice_date}T12:00:00.000Z` : now;
   const orderNumber = "DH" + Date.now().toString(36).toUpperCase() + orderId.slice(0, 8).toUpperCase();
   const responseBody = {
     order_id: orderId, order_number: orderNumber, total, gold_debt_99: goldDebt99,
@@ -270,7 +273,7 @@ async function createOrder({ request, env }, { tenantId, userId }) {
               ${trade_in_total}, ${trade_in_details ? JSON.stringify(trade_in_details) : null},
               ${gold_price_99}, ${gold_sold_99}, ${gold_bought_99}, ${gold_to_money_99},
               ${goldDebt99}, ${making_fee_total}, ${notes || null}, ${old_money_debt}, ${old_gold_debt_99},
-              ${userId}, ${now}, ${now})
+              ${userId}, ${invoiceCreatedAt}, ${now})
     `,
   ];
 
